@@ -1,0 +1,536 @@
+#!/user/bin/env python
+
+'''collection of functions for spike_sort'''
+import os
+import sys
+import numpy as np
+import pylab as py
+import cPickle as pickle
+from copy import deepcopy
+import time
+import process_tools
+
+sr=22050
+width=15  # define region to identify max/min of peaks
+threshold=.001
+
+def rt_to_sr_time(ar,sr=22050):
+    '''convert time in millisecs to time in samples'''
+    sr_ar=int(ar*22050/1000)
+    return(sr_ar)
+
+def pull_spike_region(raw_data,pos,width):
+    back = pos - width
+    forward = pos + width
+    if width > pos:
+        back = 0
+    if width + pos > len(raw_data)-1:
+        forward = len(raw_data)-1
+    return(raw_data[back:forward])
+
+
+def get_spike_peaks(raw_data,ar):
+    '''return array of peak heights for ar positions'''
+    pos_dict={}
+    good_pos=[]
+    bad_pos=[]
+    for pos in ar:
+        pos_dict[pos]={}
+        region=pull_spike_region(raw_data,pos,width)
+        pos_dict[pos]['max']=region.max()
+        pos_dict[pos]['min']=region.min()
+        delta=region.max()-region.min()
+        if delta<threshold:
+            bad_pos.append(pos)
+            pos_dict[pos]['type'] = 'shit' 
+        else:
+            good_pos.append(pos)
+            pos_dict[pos]['type']=''
+    return(pos_dict,good_pos,bad_pos)
+
+
+
+def classify_stims_spikes(pos_list,pos_dict,stim_thresh=-.04):
+    '''updates pos_dict with type="stim",type="ap" '''
+    stim_list=[]
+    for pos in pos_list:
+
+        if pos_dict[pos]['min']<stim_thresh:
+            pos_dict[pos]['type']='stim'
+            stim_list.append(pos)
+        else:
+            pos_dict[pos]['type']='spike'
+    print len(stim_list)
+    return(stim_list)
+
+
+def classify_response(pos_dict,stim_list,response_range=100):
+    pos_ar=pos_dict.keys()
+    pos_ar.sort()
+    stim_list.sort()
+    response_list=[]
+    for stim in stim_list:
+        index=pos_ar.index(stim)+1
+        if index==len(pos_ar):
+            print 'end of array'
+            continue
+       # print index,len(pos_ar)
+#        print stim==pos_ar[index]
+     #   print index
+     #   print len(pos_ar)
+     #   print pos_dict[stim]['type']
+        if pos_ar[index]-stim<response_range:
+            pos_dict[pos_ar[index]]['type']='response'
+            response_list.append(pos_ar[index])
+    return(response_list)
+
+def clean_bad_calls(raw_data,pos_list,thresh=(.001),width=15):
+    ''' remove spikes where max-local_min is below threshold '''
+    remove_list=[]
+    for pos in pos_list:
+        ar_slice=raw_data[pos-width:pos+width]
+        max_pos=ar_slice.argmax()
+        max_val=ar_slice.max()
+        right_min=ar_slice[max_pos:].min()
+        left_min=ar_slice[:max_pos].min()
+        if max_val-left_min<threshold or max_val-right_min<threshold:
+            remove_list.append(pos)
+    return(remove_list)
+    
+    
+    
+            
+
+def collapse_dbl_calls(raw_data,all_pos,pos_dict,win=(20,20),spike_type='stim'):
+    '''take all spikes within window (back,forward) and collapse into the highest peak'''
+    pos_list=list(set(all_pos))
+    pos_list.sort()
+    new_list=[]
+    collapsing=1
+    pos_to_remove=[]
+    update_dic={}
+    done=0
+    for i,pos in enumerate(pos_list[:-1]):  ## generate a list of positions to remove and a dict of new positions and values
+        if pos_list[i+1]==pos:
+            print 'ASDFASDFASDF'
+        if pos_list[i+1]-pos<win[1]:
+            collapsing=1
+            new_pos=raw_data[pos-width:pos_list[i+1]+width].argmax()
+            new_pos+=(pos-width)
+            
+    #        print '%s,%s is new position from %s,%s and %s,%s' %(new_pos,raw_data[new_pos],pos,raw_data[pos],pos_list[i+1],raw_data[pos_list[i+1]])
+            update_dic[new_pos]={'max':raw_data[new_pos],'min':raw_data[new_pos-width:new_pos+width],'type':spike_type}
+            pos_to_remove.append(pos)
+            pos_to_remove.append(pos_list[i+1])
+            new_list.append(new_pos)
+        else:
+            try:
+                new_list.index(pos)
+            except ValueError:
+                new_list.append(pos)
+        
+            
+    print 'original list = %s;  new list = %s;  removed %s spikes' % (len(pos_list),len(new_list),len(pos_list)-len(new_list))
+    #for pos in set(pos_to_remove):
+    #    try:
+    #        pos_dict.pop(pos)
+    #    except KeyError:
+    #        print 'error removing %s from dictionary' %s
+    #        continue
+    pos_dict.update(update_dic)
+ #   print new_list
+    return(new_list)
+
+def pull_response_traces(raw_data,stim_list,downstream=500,start=10,back=20): 
+    ''' pull trace array for stims in stim_list and return a dictionary of responses keyed by stim position'''
+    response_dict = {}
+    stim_list.sort()
+    length=0
+    if len(stim_list)==1:
+        stim=stim_list[0]
+        if stim+downstream>len(raw_data):
+            length=len(raw_data)-stim
+        else:
+            length=downstream
+        response_dict[stim]=raw_data[stim+start:stim+length]
+        return(response_dict)
+    for i,stim in enumerate(stim_list[:-1]):
+        if (stim_list[i+1]-stim) < (start+downstream):
+            length = (stim_list[i+1]-stim)-back
+        elif stim+downstream>len(raw_data):
+            length=length(raw_data)-stim
+        else:
+            length = downstream
+      #  print 'downstream = %s'%downstream
+        response_dict[stim] = raw_data[stim+start:stim+length]
+        if i==len(stim_list)-2:
+            if stim_list[i+1]+length < len(raw_data):
+                response_dict[stim_list[i+1]] = raw_data[stim_list[i+1]+start:stim_list[i+1]+length]
+            else:
+                response_dict[stim_list[i+1]] = raw_data[stim_list[i+1]+start:]
+    return (response_dict)
+    
+def group_spikes_in_freq(spike_list,freq):
+    '''return list of lists for positions at >=freq'''
+    spike_list.sort()
+    group_list=[]
+    member_list=[]
+    print len(spike_list)
+    for i,spike in enumerate(spike_list[:-1]):
+        inst_freq=freq_given_numsamples(spike_list[i+1]-spike)             
+#        print spike_list[i+1]-spike             
+#        print inst_freq
+#        print spike
+        if inst_freq>freq:
+            member_list.append(spike)
+        elif len(member_list)>0:
+            member_list.append(spike_list[i])
+            if i==len(spike_list)-1:  ### check last spike in list
+                member_list.append(spike_list[i+1])
+            group_list.append(member_list)
+            member_list=[]
+        else:
+            member_list=[]
+        if i == len(spike_list[:-1])-1 and len(member_list)>0:
+            member_list.append(spike_list[i+1])
+            group_list.append(member_list)
+                               
+        
+    return(group_list)
+
+def classify_stims(stim_list):
+    stim_dict = {(0,2):'s',(9,11):'ff',(1,3):'pp',(20,300):'ECS'}
+    group_dict = {}
+    singles = [stim for stim in stim_list]
+    for key in stim_dict:
+        group_dict[stim_dict[key]]=[]
+    groups_list=group_spikes_in_freq(stim_list,5)
+    #  print groups_list
+    for group in groups_list:
+        num=len(group)
+      #  print num
+        for member in group:
+            singles.remove(member)
+        for key in stim_dict.keys():
+            if num>key[0] and num<key[1]:
+                group_dict[stim_dict[key]].append(group)
+    group_dict['s']=[singles]
+    return(group_dict)
+
+def freq_given_numsamples(num):
+    return(1./(num/sr))
+
+def freq_shape(pos_list,win=4):
+    '''returns an array size seq with frequency values for averaged over win'''
+    pos_list.sort()
+    if len(pos_list)<win:
+        win=len(pos_list)/2
+    freq_list=[]#[freq_given_numsamples(pos_list[win/2]-pos_list[0])]
+    for i in range(0,len(pos_list)):
+        if i<win/2:
+            back=i
+        else:
+            back=win/2
+        if (len(pos_list)-1)-i<win/2:
+            forward=(len(pos_list)-1)-i
+        else:
+            forward=win/2
+        freq_list.append(freq_given_numsamples(pos_list[i+forward]-pos_list[i-back])*(i+forward-(i-back)))
+#    freq_list.append(freq_given_numsamples(pos_list[-1]-pos_list[len(pos_list)-(1+win)]))
+    return(freq_list)
+
+
+
+
+def open_all(path,ch,num_channels,start = 0, end = 10):
+    ''' open data files for given channel, default start at 0, end at 10'''
+    num_files=len(os.listdir(path))/num_channels
+    data=[]
+    file_prefix= path.strip().split('/')[-2]
+    total_length=0
+    for f in range(start,end):
+        fh=open('%s%s_test_ch%s_%s'%(path,file_prefix,ch,f))
+        #print fh
+        raw_ar=pickle.load(fh)
+        fh.close()
+        data.append(raw_ar)
+        total_length+=len(raw_ar)
+    full=np.zeros(total_length,'f')
+    pos=0
+    for i,v in enumerate(data):
+        l=len(v)
+        full[pos:pos+l]=v
+        pos+=l
+    return(full)
+
+def local_minima(ar, window=4): # taken from http://old.nabble.com/Finding-local-minima-of-greater-than-a-given-depth-td18988309.html
+    """
+    Find the local minima within fits, and return them and their indices.
+
+    Returns a list of indices at which the minima were found, and a list of the
+    minima, sorted in order of increasing minimum.  The keyword argument window
+    determines how close two local minima are allowed to be to one another.  If
+    two local minima are found closer together than that, then the lowest of
+    them is taken as the real minimum.  window=1 will return all local minima.
+
+    """
+    fits=list(ar)
+    from scipy.ndimage.filters import minimum_filter as min_filter
+
+    minfits = min_filter(fits, size=window, mode="wrap")
+
+    minima = []
+    for i in range(len(fits)):
+        if fits[i] == minfits[i]:
+            minima.append(fits[i])
+
+    minima.sort()
+
+    good_indices = [ fits.index(fit) for fit in minima ]
+    good_fits = [ fit for fit in minima ]
+#    print len(good_indices)
+#    print len(good_fits)
+    return(good_indices, good_fits) 
+
+
+def mean_period(li):
+    ''' returns the mean period(ms) from a list of time points '''    
+    ar = np.array(li)
+    period = np.diff(ar).mean()*1000/22050.
+    return period
+
+def get_spf(path,header):
+    fh = open('%s/%s_test_ch1_0'%(path,header),'r')
+    data = pickle.load(fh)
+    return(len(data))
+
+def check_stims_by_channel(stims_by_channel,nearest = 3):
+    ''' return a master list of stims given a list of arrays of stim positions '''
+    ch_keys = stims_by_channel.keys()
+    all_stims = np.concatenate([stims_by_channel[ch]['stims'] for ch in ch_keys])
+    all_sizes = np.concatenate([stims_by_channel[ch]['size'] for ch in ch_keys])
+    sorted_sizes = all_sizes[all_stims.argsort()]
+    all_stims.sort()
+    all_stims_diff = np.diff(all_stims)
+    all_stims_indices = np.where(all_stims_diff > nearest)[0]
+    combined_stims = []
+    combined_sizes = []
+    start = 0
+    for i in all_stims_indices:
+        combined_stims.append(int(np.sum(all_stims[start:i+1])/(i+1 - start)))
+        combined_sizes.append((np.sum(sorted_sizes[start:i+1])/(i+1 - start)))
+        start = i+1
+    combined_stims.append(int(np.sum(all_stims[start:])/(len(all_stims) - start)))
+    combined_sizes.append((np.sum(sorted_sizes[start:])/(len(all_stims) - start)))
+    return(np.array(combined_stims),np.array(combined_sizes))
+
+
+def remove_dbl_calls(pos_ar,ar,window = 20):
+    ''' given a list of positions, remove adjacent positions within window ''' 
+    remove_positions = []
+    pos_ar.sort()
+    diff_ar = np.diff(pos_ar)
+    to_close = np.where(diff_ar < window)[0]
+    for v in to_close:
+        if ar[pos_ar[v]] > ar[pos_ar[v+1]]:
+            remove_positions.append(pos_ar[v+1])
+        else:
+            remove_positions.append(pos_ar[v])
+    pos_list = list(pos_ar)
+    for pos in set(remove_positions):
+        pos_list.remove(pos)
+    return(np.array(pos_list))
+    
+
+
+
+def get_stim_size(trace):
+    ''' given a trace containing stim region, determine the size of the stim 
+    where size = max - min '''
+
+    diff_ar = np.diff(trace)
+    sort_indices = diff_ar.argsort()
+    diff_ar.sort()
+
+    try:
+        size = np.sum([abs(x) for x in diff_ar[[0,1,-2,-1]]])
+    except:
+        size = 0
+        print 'size error %s' %(len(trace))
+#    size = np.sum([abs(x) for x in trace[max_loss +1 :max_diff + 4]])
+    return size
+
+def get_stim_size_old(trace):
+    ''' given a trace containing stim region, determine the size of the stim 
+    where size = max - min '''
+
+    trace.sort()
+
+    try:
+        size = np.sum([abs(x) for x in trace[[0,1,-5,-4,-3,-2,-1]]])
+    except:
+        size = 0
+        print 'size error %s' %(len(trace))
+#    size = np.sum([abs(x) for x in trace[max_loss +1 :max_diff + 4]])
+    return size
+
+
+
+
+
+def group_stims_by_freq(stims):
+    ''' given a list/array of stims, group by freq '''
+    ar = np.array(stims)
+    ar.sort()
+    ar_diff = np.diff(ar)
+    singles_list = [0]
+    singles_list.extend(np.where(ar_diff > 0.5 * sr)[0] + 1)
+    singles_ind = np.array(singles_list)
+    multiples = []
+    single_breaks = np.where(np.diff(singles_ind) > 1)[0]
+    for i,v in enumerate(singles_ind[:-1]):
+        multiples.append(ar[v:singles_ind[i+1]])
+    multiples.append(ar[singles_ind[-1]:])
+    return multiples
+
+
+
+'''
+    for sb in single_breaks:
+        start = ar[singles_ind[sb]]
+        end = ar[singles_ind[sb+1]]
+        multiples.append(ar[singles_ind[sb]:singles_ind[sb+1]])
+        singles_list.remove(singles_ind[sb-1])
+    return(singles_list,multiples)
+'''
+        
+
+
+                  
+def fwhm(trace):
+    ''' return the full width at half maximum for a trace containing a spike'''
+    max_i = trace.argmax()
+    half_max = trace.max()/2.
+    below_half = np.where(trace < half_max)[0]
+    try:
+        lower_i = below_half[below_half.searchsorted(max_i) - 1]
+        upper_i = below_half[below_half.searchsorted(max_i) + 1]
+        fwhm = upper_i - lower_i
+    except:
+        fwhm = 0
+        print 'error in fhwm'
+    return fwhm
+
+
+#if __name__ == "__main__":
+def analyse_data(path):
+    files=os.listdir(path)
+    header = path.split('/')[-2]
+    spf = get_spf(path,header)
+    ch_dict={}    
+    print "------------------- open raw data , determine number of channels  ----------------"
+    for f in files:
+        try:
+            ch=f.strip().split('_')[-2]
+        except:
+            continue
+        if ch[:2]=='ch':
+            ch_dict[ch]={}
+    print " channels: "
+    print ch_dict.keys()
+    spike_dict = {}
+    num_chans = len(ch_dict.keys())
+    num_files = len(files)/num_chans  # num_files is files per channel
+    total_length = 0
+    for ch in ch_dict.keys():
+        new_length = 0
+        print 'starting %s' % ch
+        spike_traces = []
+        spike_positions = []
+        for seg_start in xrange(0,num_files,10):
+            if num_files-seg_start < 10:
+                seg_end = num_files 
+            else:
+                seg_end = seg_start+10
+                
+
+            raw_data = open_all(path,ch[-1],len(ch_dict.keys()),start = seg_start, end = seg_end)
+            trace_grad,raw_spike_list = process_tools.rising_phases(raw_data)
+
+            spike_list = process_tools.wiggle([x[0] for x in raw_spike_list],raw_data)
+            if len(spike_list) == 0:
+                continue
+
+            while(len(raw_data) - spike_list[-1] < 100): ## removing spikes that fall at the end (within 100 samples ) of the raw data trace
+                print "popping"
+                if len(spike_list) < 1:
+                    break
+                spike_list.pop()
+            new_length+=len(raw_data)
+            spike_traces.extend([raw_data[x-10:x+70]-raw_data[x] for x in spike_list])
+            spike_positions.extend(x + spf * seg_start for x in spike_list)
+        spike_dict[ch] ={'positions':np.array(spike_positions),'traces':np.array(spike_traces)}
+        if new_length > total_length:
+            total_length = new_length
+                
+
+    #[py.plot(spike) for spike in spike_traces]
+    #py.plot(np.linspace(0,len(stims_cat),len(stim_dict['ch1']['size'])),stim_dict['ch1']['size'])
+    
+    #py.show()
+
+    
+    
+    fh = open('spike_pickles/%s_spikes.pkl'%header, 'w')
+    pickle.dump(spike_dict,fh)
+    fh.close()
+
+    
+
+    
+    return()#{'stims':combined_stims,'sizes':combined_sizes,'traces': [stim_dict[ch]['traces'] for ch in stim_dict.keys()]})
+        
+
+        
+import shutil
+root=sys.argv[1]
+walk=list(os.walk(root))
+allow_list = ["514_kcl_aft___1311976751.12"]
+paths=[]
+
+anal_dict={}
+path_list=[]
+dir_dic = {}
+#output_dir = '/home/rich/Lab/OpenElectrophy/old/logfiles'
+output_dir = '/home/rich/Lab/thesis/testlogs'
+for path in walk:
+    #print path[0]
+    paths.append(path[0])
+    
+
+for path in paths:   
+    try:
+        htime=time.ctime(float(path.split('/')[-1].split('_')[-1]))
+    except:
+        print path
+        continue
+    if int(htime.strip().split(" ")[-1]) < 2010:
+        print htime
+        continue
+    full_path=path+"/"
+    path_list.append(full_path)
+    print full_path
+
+for i,path in enumerate(set(path_list)):
+    print i,len(set(path_list))
+    print path
+    header = path.split('/')[-2]
+    print '%s/%s_logfile.txt'%(output_dir,header)
+
+    if os.path.isfile('%s/%s_logfile.txt'%(output_dir,header)):
+        print 'skipping'
+        continue
+
+    anal_dict[path]=analyse_data(path)        
+
+
